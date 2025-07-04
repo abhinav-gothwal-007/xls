@@ -32,6 +32,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
+#include "clang/include/clang/AST/Decl.h"
 #include "xls/common/math_util.h"
 #include "xls/common/status/status_macros.h"
 #include "xls/contrib/xlscc/tracked_bvalue.h"
@@ -235,23 +236,58 @@ absl::Status NewFSMGenerator::LayoutValuesToSaveForNewFSMStates(
     const xls::SourceInfo& body_loc) {
   // Fill in values to save after each state, in case of an activation
   // transition.
+  //
   // States are now flattened and linear, so this can be handled as if
   // phis / jumps / loops don't exist, with a simple reference count for each
   // continuation value, initialized when the value is produced to the total
   // number of references in the graph.
+  //
+  // One caveat exists to the above: ContinuationValue* pointers are now no
+  // longer sufficient to identify a given value. Using them alone will produce
+  // a lot of false positives for values to save due to aliasing in later
+  // loop iteration states.
 
-  absl::flat_hash_map<const ContinuationValue*, int64_t>
-      total_input_count_by_value;
+  struct ValueKey {
+    const ContinuationValue* value = nullptr;
+    const NewFSMState* state_produced = nullptr;
+
+    bool operator<(const ValueKey& other) const {
+      if (value != other.value) {
+        return value < other.value;
+      }
+      return state_produced < other.state_produced;
+    }
+  };
+
+  absl::btree_map<ValueKey, int64_t> total_input_count_by_value;
+
+  absl::flat_hash_map<const ContinuationValue*, const NewFSMState*>
+      last_state_produced_value;
 
   for (const NewFSMState& state : layout.states) {
     for (const auto& [input_param, continuation_out] :
          state.current_inputs_by_input_param) {
-      ++total_input_count_by_value[continuation_out];
+      ++total_input_count_by_value[ValueKey{
+          .value = continuation_out,
+          .state_produced = last_state_produced_value.at(continuation_out),
+      }];
+    }
+
+    const GeneratedFunctionSlice* slice =
+        layout.slice_by_index.at(state.slice_index);
+
+    for (const ContinuationValue& continuation_out : slice->continuations_out) {
+      last_state_produced_value[&continuation_out] = &state;
+      total_input_count_by_value[ValueKey{
+          .value = &continuation_out,
+          .state_produced = &state,
+      }] = 0;
     }
   }
 
-  absl::flat_hash_map<const ContinuationValue*, int64_t>
-      remaining_input_count_by_value;
+  last_state_produced_value.clear();
+
+  absl::btree_map<ValueKey, int64_t> remaining_input_count_by_value;
 
   for (NewFSMState& state : layout.states) {
     const GeneratedFunctionSlice* slice =
@@ -259,27 +295,35 @@ absl::Status NewFSMGenerator::LayoutValuesToSaveForNewFSMStates(
     // Decrement input counts
     for (const auto& [input_param, continuation_out] :
          state.current_inputs_by_input_param) {
-      XLSCC_CHECK(remaining_input_count_by_value.contains(continuation_out),
-                  body_loc);
-      --remaining_input_count_by_value[continuation_out];
+      const ValueKey key = {
+          .value = continuation_out,
+          .state_produced = last_state_produced_value.at(continuation_out),
+      };
+      XLSCC_CHECK(remaining_input_count_by_value.contains(key), body_loc);
+      --remaining_input_count_by_value[key];
     }
 
     // Record output counts, including all future uses
     for (const ContinuationValue& continuation_out : slice->continuations_out) {
       // Due to virtual unrolling, continuation values may be produced
       // multiple times
-      if (remaining_input_count_by_value.contains(&continuation_out)) {
-        continue;
-      }
-      remaining_input_count_by_value[&continuation_out] =
-          total_input_count_by_value.at(&continuation_out);
+      const ValueKey key = {
+          .value = &continuation_out,
+          .state_produced = &state,
+      };
+      XLSCC_CHECK(!remaining_input_count_by_value.contains(key), body_loc);
+      XLSCC_CHECK(total_input_count_by_value.contains(key), body_loc);
+      // Don't do [] = .at()
+      const auto total_count = total_input_count_by_value.at(key);
+      remaining_input_count_by_value[key] = total_count;
+      last_state_produced_value[&continuation_out] = &state;
     }
 
     for (const auto& [value, count] : remaining_input_count_by_value) {
       if (count == 0) {
         continue;
       }
-      state.values_to_save.insert(value);
+      state.values_to_save.insert(value.value);
     }
   }
 
@@ -334,8 +378,12 @@ void NewFSMGenerator::PrintNewFSMStates(const NewFSMLayout& layout) {
 absl::StatusOr<GenerateFSMInvocationReturn>
 NewFSMGenerator::GenerateNewFSMInvocation(
     const GeneratedFunction* xls_func,
-    const std::vector<TrackedBValue>& direct_in_args, xls::ProcBuilder& pb,
-    const xls::SourceInfo& body_loc) {
+    const std::vector<TrackedBValue>& direct_in_args,
+    const absl::flat_hash_map<const clang::NamedDecl*, xls::StateElement*>&
+        state_element_for_static,
+    const absl::flat_hash_map<const clang::NamedDecl*, int64_t>&
+        return_index_for_static,
+    xls::ProcBuilder& pb, const xls::SourceInfo& body_loc) {
   XLSCC_CHECK_NE(xls_func, nullptr, body_loc);
   const GeneratedFunction& func = *xls_func;
 
@@ -352,6 +400,22 @@ NewFSMGenerator::GenerateNewFSMInvocation(
 
   const int64_t num_slice_index_bits =
       xls::CeilOfLog2(1 + layout.states.size());
+
+  // TODO(seanhaskell): Clean this up once the old FSM is removed
+  xls::Type* top_return_type =
+      xls_func->slices.back().function->return_value()->GetType();
+
+  std::vector<TrackedBValue> return_values;
+  if (return_index_for_static.size() > 1) {
+    for (int64_t i = 0; i < top_return_type->AsTupleOrDie()->size(); ++i) {
+      return_values.push_back(pb.Literal(
+          xls::ZeroOfType(top_return_type->AsTupleOrDie()->element_type(i)),
+          body_loc));
+    }
+  } else {
+    return_values.push_back(
+        pb.Literal(xls::ZeroOfType(top_return_type), body_loc));
+  }
 
   TrackedBValue next_activation_slice_index = pb.StateElement(
       "__next_activation_slice",
@@ -449,6 +513,8 @@ NewFSMGenerator::GenerateNewFSMInvocation(
 
   for (int64_t slice_index = 0; slice_index < func.slices.size();
        ++slice_index) {
+    const bool is_last_slice = (slice_index == func.slices.size() - 1);
+
     TrackedBValue slice_active = pb.Eq(
         current_slice_index,
         pb.Literal(xls::UBits(slice_index, num_slice_index_bits)), body_loc,
@@ -473,7 +539,7 @@ NewFSMGenerator::GenerateNewFSMInvocation(
     std::vector<TrackedBValue> invoke_params;
     invoke_params.reserve(slice.continuations_in.size() + 1);
 
-    // Add direct-ins to first slice params
+    // Add direct-ins (and top class input) to first slice params
     if (slice_index == 0) {
       invoke_params.insert(invoke_params.end(), direct_in_args.begin(),
                            direct_in_args.end());
@@ -519,6 +585,14 @@ NewFSMGenerator::GenerateNewFSMInvocation(
       if (io_return.received_value.valid()) {
         invoke_params.push_back(io_return.received_value);
       }
+    }
+
+    // Add statics
+    for (const clang::NamedDecl* decl : slice.static_values) {
+      xls::StateElement* state_element = state_element_for_static.at(decl);
+      xls::StateRead* state_read = pb.proc()->GetStateRead(state_element);
+      TrackedBValue prev_val(state_read, &pb);
+      invoke_params.push_back(prev_val);
     }
 
     XLSCC_CHECK_NE(slice.function, nullptr, body_loc);
@@ -574,22 +648,6 @@ NewFSMGenerator::GenerateNewFSMInvocation(
           .condition = slice_active,
       };
 
-      // Enable narrowing by including the loop jump condition in the next value
-      // condition.
-      //
-      // This is safe to do because after the loop, values are fed forward.
-      // Any feedback via state elements is from the iteration before, via the
-      // loop body logic.
-      //
-      // TODO(seanhaskell): Either use values_to_save with next values from
-      // jump state, or apply loop condition to all slices in the loop body.
-      //
-      // This doesn't work for a non-trivial loop body, as there may be
-      // feedbacks that are not from the last state in the body.
-      if (layout.transition_by_slice_from_index.contains(slice_index)) {
-        next_value.condition = pb.And(next_value.condition, last_op_out_value);
-      }
-
       // Generate next values
       extra_next_state_values.insert(
           {state_element_by_continuation_value.at(&continuation_out)
@@ -597,6 +655,43 @@ NewFSMGenerator::GenerateNewFSMInvocation(
                ->As<xls::StateRead>()
                ->state_element(),
            next_value});
+    }
+
+    if (is_last_slice) {
+      std::vector<const clang::NamedDecl*> all_static_values;
+
+      for (const auto& [name, _] : return_index_for_static) {
+        all_static_values.push_back(name);
+      }
+
+      // Determinism
+      std::sort(all_static_values.begin(), all_static_values.end(),
+                [&return_index_for_static](const clang::NamedDecl* a,
+                                           const clang::NamedDecl* b) {
+                  return return_index_for_static.at(a) <
+                         return_index_for_static.at(b);
+                });
+
+      for (int64_t static_index = 0; static_index < all_static_values.size();
+           ++static_index) {
+        const int64_t return_index =
+            return_index_for_static.at(all_static_values.at(static_index));
+        (void)return_index;
+        // TODO: Name
+        TrackedBValue output_value;
+        // TODO(seanhaskell): Normalize last slice return
+        if (all_static_values.size() == 1) {
+          output_value = ret_tup;
+        } else {
+          output_value = pb.TupleIndex(ret_tup, static_index, body_loc);
+        }
+
+        XLSCC_CHECK(output_value.GetType()->IsEqualTo(
+                        return_values.at(return_index).GetType()),
+                    body_loc);
+
+        return_values.at(return_index) = output_value;
+      }
     }
 
     if (layout.transition_by_slice_from_index.contains(slice_index)) {
@@ -679,11 +774,16 @@ NewFSMGenerator::GenerateNewFSMInvocation(
            .condition = after_last_slice,
        }});
 
+  TrackedBValue return_value;
+
+  if (return_index_for_static.size() > 1) {
+    return_value = pb.Tuple(ToNativeBValues(return_values), body_loc);
+  } else {
+    return_value = return_values.at(0);
+  }
+
   return GenerateFSMInvocationReturn{
-      .return_value = pb.Literal(
-          xls::ZeroOfType(
-              xls_func->slices.back().function->return_value()->GetType()),
-          body_loc),
+      .return_value = return_value,
       .returns_this_activation = after_last_slice,
       .extra_next_state_values = extra_next_state_values};
 }

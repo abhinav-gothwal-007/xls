@@ -192,6 +192,7 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
+        "@llvm-project//clang:ast",
     ],
 )
 
@@ -221,6 +222,7 @@ cc_library(
         "//xls/common:stopwatch",
         "//xls/common/status:ret_check",
         "//xls/common/status:status_macros",
+        "//xls/data_structures:leaf_type_tree",
         "//xls/interpreter:ir_interpreter",
         "//xls/ir",
         "//xls/ir:bits",
@@ -236,6 +238,7 @@ cc_library(
         "//xls/ir:type",
         "//xls/ir:value",
         "//xls/ir:value_utils",
+        "//xls/passes:dataflow_simplification_pass",
         "//xls/passes:dce_pass",
         "//xls/passes:optimization_pass",
         "//xls/passes:pass_base",
